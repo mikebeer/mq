@@ -451,7 +451,12 @@ PROCEDURE(mqsubscribe) {
     if (prefetch < 0) prefetch = 0;
     amqp_basic_qos(h->conn, MQ_CHANNEL, 0, (uint16_t)prefetch, 0);
     rc = check_reply(h, amqp_get_rpc_reply(h->conn), "basic.qos");
-    if (rc) RETURNINTX(rc);
+    if (rc) {
+        /* the broker had already closed the channel (for instance after a publish to a
+           missing exchange): answer it and open the channel again so the handle stays usable */
+        reopen_channel_if_needed(h, rc);
+        RETURNINTX(rc);
+    }
     amqp_basic_consume(h->conn, MQ_CHANNEL, amqp_cstring_bytes(queue), amqp_empty_bytes,
                        0, 0, 0, amqp_empty_table);
     rc = check_reply(h, amqp_get_rpc_reply(h->conn), "basic.consume");

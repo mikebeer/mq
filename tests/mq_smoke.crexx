@@ -74,6 +74,19 @@ if mqqueue(h, qname, "") <> 0 then do
   exit 1
 end
 
+/* regression: a publish to a missing exchange is accepted (rc 0) and the broker then closes the
+   channel; the next subscribe reports it and the handle must still be usable afterwards */
+call mqpublish h, "rxmq.no.such.exchange", "k", "x", ""
+call mqpublish h, "", qname, "settle", ""
+if mqsubscribe(h, qname, 1) >= 0 then do
+  say "FAIL: subscribe after a publish to a missing exchange should report the closed channel"
+  exit 1
+end
+if mqsubscribe(h, qname, 1) <> 0 then do
+  say "FAIL: handle unusable after the channel was closed:" mqerror(h)
+  exit 1
+end
+
 call mqdelete h, qname
 call mqdisconnect h
 say "PASS: rxmq smoke"
