@@ -1,0 +1,28 @@
+/* worker - take jobs from a queue, one at a time, until the program is stopped */
+options levelb
+import rxmq
+
+arg argv = .string[]
+jobq = "jobs"
+if argv.0 >= 1 then jobq = argv[1]
+
+h = mqconnect("localhost", 5672, "guest", "guest", "/")
+if h < 1 then do
+  say "cannot connect:" mqerror(0)
+  exit 1
+end
+
+call mqqueue h, jobq, "DURABLE"
+call mqsubscribe h, jobq, 1
+say "worker waiting on" jobq
+
+msg = .string[]
+do while mqreceive(h, -1, msg) = 0
+  say "working on:" msg[1]
+  /* ... the real work goes here ... */
+  call mqack h, msg[2]
+end
+
+say "receive failed:" mqerror(h)
+call mqdisconnect h
+exit 1

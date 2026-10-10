@@ -1,0 +1,26 @@
+/* caller - send one request to an mqserver queue and print the reply */
+options levelb
+import rxmq
+
+arg argv = .string[]
+jobq = "jobs"
+if argv.0 >= 1 then jobq = argv[1]
+
+h = mqconnect("localhost", 5672, "guest", "guest", "/")
+if h < 1 then do
+  say "cannot connect:" mqerror(0)
+  exit 1
+end
+
+replyq = mqtempqueue(h)
+call mqsubscribe h, replyq, 1
+call mqpublish h, "", jobq, "upper hello", "reply_to=" || replyq || " correlation_id=req-1"
+
+msg = .string[]
+if mqreceive(h, 5000, msg) = 0 then do
+  say "reply:" msg[1] "(correlation id" msg[4] || ")"
+  call mqack h, msg[2]
+end
+else say "no reply:" mqerror(h)
+
+call mqdisconnect h

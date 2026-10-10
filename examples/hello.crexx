@@ -1,0 +1,22 @@
+/* hello - send one message to a queue and read it back */
+options levelb
+import rxmq
+
+h = mqconnect("localhost", 5672, "guest", "guest", "/")
+if h < 1 then do
+  say "cannot connect:" mqerror(0)
+  exit 1
+end
+
+call mqqueue h, "hello", "DURABLE"
+call mqpublish h, "", "hello", "Hello, broker", "persistent"
+
+call mqsubscribe h, "hello", 1
+msg = .string[]
+if mqreceive(h, 5000, msg) = 0 then do
+  say "received:" msg[1]
+  call mqack h, msg[2]
+end
+else say "nothing received:" mqerror(h)
+
+call mqdisconnect h

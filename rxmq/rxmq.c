@@ -227,7 +227,7 @@ PROCEDURE(mqconnect) {
     }
     rc = amqp_socket_open(sock, host, port);
     if (rc) {
-        set_err(NULL, "cannot connect to %s:%d: %s", host, port, amqp_error_string2(rc));
+        set_err(NULL, "tcp connect: %s", amqp_error_string2(rc));
         amqp_destroy_connection(h->conn);
         RETURNINTX(MQE_OPEN);
     }

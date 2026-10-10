@@ -8,7 +8,9 @@ through RabbitMQ (AMQP 0-9-1).
 | `rxmq/` | **rxmq**, a native RXPA plugin that wraps `librabbitmq-c`. REXX programs `import rxmq` and call `mqconnect`, `mqpublish`, `mqreceive` and friends. |
 | `rabbitmq-crexx-client/` | **mqclient**, a command line client written in cREXX: `send`, `get`, `rpc`, `purge`. |
 | `rabbitmq-crexx-server/` | **mqserver**, a request/reply service written in cREXX. It consumes a queue, answers each request on the request's `reply_to` queue and acknowledges it. Change `handle()` to serve your own verbs. |
-| `tests/` | `mq_smoke.crexx` and `run_tests.sh`, which runs the whole thing against a live broker. |
+| `examples/` | `hello`, `worker` and `caller`, small programs to start from. |
+| `tests/` | `mq_smoke.crexx`, `mq_pubsub.crexx` and `run_tests.sh`, which runs the whole thing against a live broker. |
+| `docs/` | `MQ-Guide-build1.docx`, the user's guide. |
 
 ## Build
 
@@ -63,7 +65,7 @@ number on failure. `mqerror(handle)` returns the text of the last error
 
 | Call | Purpose |
 |---|---|
-| `mqconnect(broker, port, user, password, vhost)` | Connect and open a channel. Returns a handle (1..16). Empty/zero arguments use `localhost`, 5672, `guest`, `guest`, `/`. |
+| `mqconnect(broker, port, user, password, vhost)` | Connect and open a channel. Returns a handle (1..16). An empty broker, user or vhost and a port of 0 use `localhost`, `guest`, `/` and 5672; the password has no default, pass `"guest"`. |
 | `mqdisconnect(handle)` | Close channel and connection. |
 | `mqqueue(handle, name, flags)` | Declare a queue. Flags: `DURABLE EXCLUSIVE AUTODELETE PASSIVE`. `PASSIVE` only checks that it exists. |
 | `mqtempqueue(handle)` | Declare an exclusive, auto-delete queue with a broker-generated name and return the name (`""` on error). Use it as a reply queue. |
@@ -122,4 +124,4 @@ end
 plugin round trip (publish, properties, subscribe, receive, ack, timeout), the
 server with RPC verbs and self-stop, `send`/`get`, timeouts and exit codes, an
 unreachable broker, broker-side errors, and server recovery after its queue is
-deleted. It takes about 15 seconds.
+deleted. It runs 25 checks and takes about 30 seconds.

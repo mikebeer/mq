@@ -35,10 +35,16 @@ check() {   # check <label> <expected> <actual>
 build mq_smoke  "$REPO/tests/mq_smoke.crexx"
 build mqserver  "$REPO/rabbitmq-crexx-server/mqserver.crexx"
 build mqclient  "$REPO/rabbitmq-crexx-client/mqclient.crexx"
-echo "[$(ts)] built mq_smoke, mqserver, mqclient"
+build mq_pubsub "$REPO/tests/mq_pubsub.crexx"
+build ex_hello  "$REPO/examples/hello.crexx"
+build ex_worker "$REPO/examples/worker.crexx"
+build ex_caller "$REPO/examples/caller.crexx"
+echo "[$(ts)] built mq_smoke, mq_pubsub, mqserver, mqclient and the examples"
 
 out=$(rxvm mq_smoke.rxbin rx_rxmq "$CREXX_HOME/bin/library" 2>&1)
 check "smoke test" "PASS: rxmq smoke" "$out"
+out=$(rxvm mq_pubsub.rxbin rx_rxmq "$CREXX_HOME/bin/library" 2>&1)
+check "fanout publish/subscribe, dropped message" "PASS: rxmq publish/subscribe" "$out"
 
 Q=rxmq.test.requests
 C="run mqclient -b $MQ_BROKER -t 8000"
@@ -103,6 +109,43 @@ for _ in $(seq 1 10); do kill -0 $SERVER2 2>/dev/null || break; sleep 0.5; done
 kill $SERVER2 2>/dev/null; wait $SERVER2 2>/dev/null
 check "server noticed the lost queue" "1" "$(grep -c 'is gone - re-creating' server2.log)"
 $C purge $D >/dev/null 2>&1
+
+# two servers on one queue share the work (the broker hands out one request at a time)
+W=rxmq.test.shared
+$C purge $W >/dev/null 2>&1
+run mqserver -b "$MQ_BROKER" -V $W >w1.log 2>&1 &
+W1=$!
+run mqserver -b "$MQ_BROKER" -V $W >w2.log 2>&1 &
+W2=$!
+sleep 2
+for n in 1 2 3 4 5 6 7 8; do $C rpc $W echo job$n >/dev/null 2>&1; done
+sleep 1
+kill $W1 $W2 2>/dev/null; wait $W1 $W2 2>/dev/null
+n1=$(grep -c '^request:' w1.log); n2=$(grep -c '^request:' w2.log)
+check "two servers served all 8 requests" "8" "$((n1 + n2))"
+check "both servers took part" "1" "$([ "$n1" -gt 0 ] && [ "$n2" -gt 0 ] && echo 1 || echo 0)"
+$C purge $W >/dev/null 2>&1
+
+# the example programs of the manual
+rabbitmqctl delete_queue hello >/dev/null 2>&1
+out=$(rxvm ex_hello.rxbin rx_rxmq "$CREXX_HOME/bin/library" 2>&1)
+check "example hello" "received: Hello, broker" "$out"
+J=rxmq.test.examples
+$C purge $J >/dev/null 2>&1
+run mqserver -b "$MQ_BROKER" -n 1 $J >server3.log 2>&1 &
+S3=$!
+sleep 2
+out=$(rxvm ex_caller.rxbin rx_rxmq "$CREXX_HOME/bin/library" -a $J 2>&1)
+check "example caller" "reply: HELLO (correlation id req-1)" "$out"
+kill $S3 2>/dev/null; wait $S3 2>/dev/null
+run ex_worker $J >worker.log 2>&1 &
+W3=$!
+sleep 2
+$C send $J first job >/dev/null 2>&1
+sleep 1
+kill $W3 2>/dev/null; wait $W3 2>/dev/null
+check "example worker" "1" "$(grep -c 'working on: first job' worker.log)"
+$C purge $J >/dev/null 2>&1
 
 # bad broker address must fail cleanly
 $C -b 127.0.0.1 -P 1 get $G >/dev/null 2>&1

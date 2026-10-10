@@ -1,0 +1,70 @@
+/* rxmq publish/subscribe test: a fanout exchange feeds two subscribers,
+   and a message sent to a queue that does not exist is silently dropped */
+options levelb
+import rxmq
+
+h1 = mqconnect("localhost", 5672, "guest", "guest", "/")
+h2 = mqconnect("localhost", 5672, "guest", "guest", "/")
+if h1 < 1 | h2 < 1 then do
+  say "FAIL: connect:" mqerror(0)
+  exit 1
+end
+
+if mqexchange(h1, "rxmq.news", "fanout", "AUTODELETE") <> 0 then do
+  say "FAIL: exchange:" mqerror(h1)
+  exit 1
+end
+
+/* each subscriber has its own temporary queue bound to the exchange */
+q1 = mqtempqueue(h1)
+q2 = mqtempqueue(h2)
+if q1 = "" | q2 = "" then do
+  say "FAIL: temporary queues:" mqerror(h1) mqerror(h2)
+  exit 1
+end
+call mqbind h1, q1, "rxmq.news", ""
+call mqbind h2, q2, "rxmq.news", ""
+call mqsubscribe h1, q1, 1
+call mqsubscribe h2, q2, 1
+
+if mqpublish(h1, "rxmq.news", "", "breaking news", "") <> 0 then do
+  say "FAIL: publish:" mqerror(h1)
+  exit 1
+end
+
+msg1 = .string[]
+msg2 = .string[]
+rc1 = mqreceive(h1, 3000, msg1)
+rc2 = mqreceive(h2, 3000, msg2)
+if rc1 <> 0 | rc2 <> 0 then do
+  say "FAIL: a subscriber got nothing, rc" rc1 rc2
+  exit 1
+end
+if msg1[1] <> "breaking news" | msg2[1] <> "breaking news" then do
+  say "FAIL: wrong bodies [" || msg1[1] || "] [" || msg2[1] || "]"
+  exit 1
+end
+if msg1[5] <> "rxmq.news" then do
+  say "FAIL: exchange name [" || msg1[5] || "]"
+  exit 1
+end
+call mqack h1, msg1[2]
+call mqack h2, msg2[2]
+
+/* publishing to a queue that does not exist raises no error and the message is lost */
+if mqpublish(h1, "", "rxmq.not.there.yet", "lost", "") <> 0 then do
+  say "FAIL: publish to a missing queue should not fail:" mqerror(h1)
+  exit 1
+end
+call mqqueue h1, "rxmq.not.there.yet", "AUTODELETE"
+call mqsubscribe h1, "rxmq.not.there.yet", 1
+rc = mqreceive(h1, 500, msg1)
+if rc <> 1 then do
+  say "FAIL: the message to a missing queue should have been dropped, rc" rc
+  exit 1
+end
+
+call mqdisconnect h1
+call mqdisconnect h2
+say "PASS: rxmq publish/subscribe"
+exit 0
