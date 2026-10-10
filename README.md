@@ -10,7 +10,7 @@ through RabbitMQ (AMQP 0-9-1).
 | `rabbitmq-crexx-server/` | **mqserver**, a request/reply service written in cREXX. It consumes a queue, answers each request on the request's `reply_to` queue and acknowledges it. Change `handle()` to serve your own verbs. |
 | `examples/` | `hello`, `worker` and `caller`, small programs to start from. |
 | `tests/` | `mq_smoke.crexx`, `mq_pubsub.crexx` and `run_tests.sh`, which runs the whole thing against a live broker. |
-| `docs/` | `MQ-Guide-build1.docx`, the user's guide. |
+| `docs/` | `MQ-Guide-build2.docx`, the user's guide. |
 
 ## Build
 
@@ -71,7 +71,8 @@ number on failure. `mqerror(handle)` returns the text of the last error
 | `mqtempqueue(handle)` | Declare an exclusive, auto-delete queue with a broker-generated name and return the name (`""` on error). Use it as a reply queue. |
 | `mqexchange(handle, name, type, flags)` | Declare an exchange (`direct`, `fanout`, `topic`, ...). Flags: `DURABLE AUTODELETE`. |
 | `mqbind(handle, queue, exchange, routingkey)` | Bind a queue to an exchange. |
-| `mqpublish(handle, exchange, routingkey, body, props)` | Publish. Exchange `""` is the default exchange: the routing key is then a queue name. |
+| `mqpublish(handle, exchange, routingkey, body, props)` | Publish. Exchange `""` is the default exchange: the routing key is then a queue name. Returns `-11` if (after `mqconfirm`) no queue could take the message. |
+| `mqconfirm(handle)` | Switch the connection to publisher confirms: `mqpublish` then waits for the broker and reports unroutable (`-11`) or refused (`-6`) messages instead of returning 0. |
 | `mqsubscribe(handle, queue, prefetch)` | Start consuming with manual acknowledgement; `prefetch` limits unacknowledged messages. |
 | `mqreceive(handle, timeout_ms, msg)` | Wait for a message. `0` = got one, `1` = timeout, negative = error. `timeout_ms < 0` waits forever. |
 | `mqack(handle, tag)` / `mqnack(handle, tag, requeue)` | Acknowledge, or reject with or without requeueing. |
@@ -114,6 +115,7 @@ end
 - **Text bodies.** Bodies are REXX strings; a body containing a NUL byte is cut at the NUL.
 - **No heartbeats.** The connection is opened with heartbeats off so a program may sit idle between calls. A broker or network failure shows up as an error from the next call.
 - **Broker-side channel errors are survivable.** If the broker closes the channel (for example `mqpurge` of a missing queue gives `404 NOT_FOUND`), the call returns an error, the channel is reopened and the handle stays usable. Subscriptions on that channel are lost and must be made again.
+- **Publishing is fire-and-forget until you call `mqconfirm`.** Without confirms a message for a queue that does not exist is dropped and `mqpublish` still returns 0. `mqclient` and `mqserver` switch confirms on.
 - **A deleted queue silently ends a subscription.** The broker does not tell this client. `mqserver` therefore checks every ~5 idle seconds that its queue still exists and re-creates and resubscribes if not.
 - **Reserved word.** `queue` is a keyword in Level B; do not use it as a variable name.
 - **Handles.** At most 16 connections per process, one channel each.
@@ -124,4 +126,4 @@ end
 plugin round trip (publish, properties, subscribe, receive, ack, timeout), the
 server with RPC verbs and self-stop, `send`/`get`, timeouts and exit codes, an
 unreachable broker, broker-side errors, and server recovery after its queue is
-deleted. It runs 25 checks and takes about 30 seconds.
+deleted. It runs 27 checks and takes about 30 seconds.

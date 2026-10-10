@@ -82,6 +82,12 @@ if h < 1 then do
   exit 1
 end
 
+/* publisher confirms: a message nobody can receive is reported instead of silently dropped */
+if mqconfirm(h) <> 0 then do
+  say "mqclient: cannot enable publisher confirms -" mqerror(h)
+  exit 1
+end
+
 result = 0
 
 if command = "send" then do

@@ -87,6 +87,50 @@ if mqsubscribe(h, qname, 1) <> 0 then do
   exit 1
 end
 
+/* publisher confirms: unroutable and refused publishes are reported, deliveries are not lost */
+if mqconfirm(h) <> 0 then do
+  say "FAIL: mqconfirm:" mqerror(h)
+  exit 1
+end
+if mqpublish(h, "", qname, "confirmed", "") <> 0 then do
+  say "FAIL: confirmed publish:" mqerror(h)
+  exit 1
+end
+if mqpublish(h, "", "rxmq.no.such.queue", "x", "") <> -11 then do
+  say "FAIL: publish to a missing queue should be -11, got [" || mqerror(h) || "]"
+  exit 1
+end
+if mqpublish(h, "rxmq.no.such.exchange", "k", "x", "") <> -6 then do
+  say "FAIL: publish to a missing exchange should be -6, got [" || mqerror(h) || "]"
+  exit 1
+end
+if mqpublish(h, "", qname, "after the error", "") <> 0 then do
+  say "FAIL: handle unusable after a refused publish:" mqerror(h)
+  exit 1
+end
+/* a consumer on the same handle: deliveries that arrive while a confirm is awaited keep their order */
+if mqsubscribe(h, qname, 0) <> 0 then do
+  say "FAIL: subscribe:" mqerror(h)
+  exit 1
+end
+do k = 1 to 5
+  call mqpublish h, "", qname, "m" || k, ""
+end
+want = "confirmed|after the error|m1|m2|m3|m4|m5"
+got = ""
+do k = 1 to 7
+  if mqreceive(h, 2000, msg) <> 0 then do
+    say "FAIL: receive" k "of 7:" mqerror(h)
+    exit 1
+  end
+  got = got || "|" || msg[1]
+  call mqack h, msg[2]
+end
+if substr(got, 2) <> want then do
+  say "FAIL: order of deliveries [" || substr(got, 2) || "]"
+  exit 1
+end
+
 call mqdelete h, qname
 call mqdisconnect h
 say "PASS: rxmq smoke"

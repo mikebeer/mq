@@ -45,10 +45,21 @@
 #define MQE_ARGUMENT   (-8)
 #define MQE_NOSPACE    (-9)
 #define MQE_STATE      (-10)
+#define MQE_UNROUTABLE (-11)
+
+/* a delivery taken off the wire while waiting for a publisher confirm, kept for mqreceive */
+typedef struct pending {
+    struct pending *next;
+    char *body, *tag, *reply_to, *corr, *exchange, *key;
+    char redelivered;
+} pending;
 
 typedef struct {
     int used;
     int chan_dead;          /* broker closed the channel; reopen before further use */
+    int confirm;            /* publisher confirms on: mqpublish waits for the broker's answer */
+    uint64_t pub_seq;       /* number of publishes since confirm.select on this channel */
+    pending *phead, *ptail;
     amqp_connection_state_t conn;
     char err[MQ_ERRLEN];
 } mq_handle;
@@ -90,6 +101,7 @@ static mq_handle *get_handle(intptr_t id)
 }
 
 static void note_channel_closed(mq_handle *h);
+static void free_pending_list(mq_handle *h);
 
 /* Turn an amqp_rpc_reply_t into 0 / negative code, recording text. */
 static int check_reply(mq_handle *h, amqp_rpc_reply_t r, const char *ctx)
@@ -138,6 +150,9 @@ static void note_channel_closed(mq_handle *h)
     memset(&ok, 0, sizeof(ok));
     amqp_send_method(h->conn, MQ_CHANNEL, AMQP_CHANNEL_CLOSE_OK_METHOD, &ok);
     h->chan_dead = 1;
+    /* deliveries set aside earlier belong to the dead channel: their tags are void and the broker
+       puts the unacknowledged messages back on their queues, so drop our copies */
+    free_pending_list(h);
 }
 
 /* After a broker side channel close, open the channel again so the handle stays usable. */
@@ -148,7 +163,15 @@ static void reopen_channel_if_needed(mq_handle *h, int rc)
         amqp_rpc_reply_t r;
         amqp_channel_open(h->conn, MQ_CHANNEL);
         r = amqp_get_rpc_reply(h->conn);
-        if (r.reply_type == AMQP_RESPONSE_NORMAL) h->chan_dead = 0;
+        if (r.reply_type == AMQP_RESPONSE_NORMAL) {
+            h->chan_dead = 0;
+            h->pub_seq = 0;
+            if (h->confirm) {           /* confirm mode belongs to the channel: ask for it again */
+                amqp_confirm_select(h->conn, MQ_CHANNEL);
+                r = amqp_get_rpc_reply(h->conn);
+                if (r.reply_type != AMQP_RESPONSE_NORMAL) h->confirm = 0;
+            }
+        }
         else DBG("channel reopen failed");
     }
 }
@@ -184,9 +207,49 @@ static char *dup_str(const char *s)
     return d;
 }
 
+static char *copy_bytes(const void *b, size_t n)
+{
+    char *d = (char *)malloc(n + 1);
+    if (d) { if (n) memcpy(d, b, n); d[n] = '\0'; }
+    return d;
+}
+
+static void free_pending(pending *n)
+{
+    free(n->body); free(n->tag); free(n->reply_to); free(n->corr); free(n->exchange); free(n->key); free(n);
+}
+
+/* Keep a delivery (method fields plus message) for mqreceive.  Returns 0 or MQE_LIBRARY. */
+static int queue_pending(mq_handle *h, uint64_t tag, int redelivered, amqp_bytes_t exch, amqp_bytes_t key,
+                         const amqp_basic_properties_t *p, amqp_bytes_t body)
+{
+    char tg[32];
+    pending *n = (pending *)calloc(1, sizeof(*n));
+    if (!n) return MQE_LIBRARY;
+    snprintf(tg, sizeof(tg), "%llu", (unsigned long long)tag);
+    n->body = copy_bytes(body.bytes, body.len);
+    n->tag = dup_str(tg);
+    n->reply_to = (p->_flags & AMQP_BASIC_REPLY_TO_FLAG) ? copy_bytes(p->reply_to.bytes, p->reply_to.len) : dup_str("");
+    n->corr = (p->_flags & AMQP_BASIC_CORRELATION_ID_FLAG) ? copy_bytes(p->correlation_id.bytes, p->correlation_id.len) : dup_str("");
+    n->exchange = copy_bytes(exch.bytes, exch.len);
+    n->key = copy_bytes(key.bytes, key.len);
+    n->redelivered = redelivered ? '1' : '0';
+    if (!n->body || !n->tag || !n->reply_to || !n->corr || !n->exchange || !n->key) { free_pending(n); return MQE_LIBRARY; }
+    if (h->ptail) h->ptail->next = n; else h->phead = n;
+    h->ptail = n;
+    return 0;
+}
+
+static void free_pending_list(mq_handle *h)
+{
+    while (h->phead) { pending *n = h->phead->next; free_pending(h->phead); h->phead = n; }
+    h->ptail = NULL;
+}
+
 static void close_handle(mq_handle *h)
 {
     if (!h->used) return;
+    free_pending_list(h);
     if (!h->chan_dead) amqp_channel_close(h->conn, MQ_CHANNEL, AMQP_REPLY_SUCCESS);
     amqp_connection_close(h->conn, AMQP_REPLY_SUCCESS);
     amqp_destroy_connection(h->conn);
@@ -372,6 +435,109 @@ PROCEDURE(mqbind) {
 }
 
 /*
+ * Publisher confirms: wait for the broker to accept (basic.ack) or refuse (basic.nack) the message
+ * just published, and for a basic.return when no queue could take it (we publish mandatory).
+ * Deliveries that arrive meanwhile are set aside for mqreceive.
+ */
+static int wait_confirm(mq_handle *h, const char *exch, const char *key)
+{
+    uint64_t want = ++h->pub_seq;
+    int returned = 0, rcode = 0;
+    char rtext[128] = "";
+    struct timeval tv;
+    long waited = 0;
+
+    for (;;) {
+        amqp_frame_t f;
+        int rc;
+        tv.tv_sec = 1; tv.tv_usec = 0;
+        rc = amqp_simple_wait_frame_noblock(h->conn, &f, &tv);
+        if (rc == AMQP_STATUS_TIMEOUT) {
+            if (++waited >= 10) { set_err(h, "publish: the broker did not confirm within 10 seconds"); return MQE_BROKER; }
+            continue;
+        }
+        if (rc != AMQP_STATUS_OK) { set_err(h, "publish: %s", amqp_error_string2(rc)); return MQE_LIBRARY; }
+        if (f.frame_type != AMQP_FRAME_METHOD) continue;
+        switch (f.payload.method.id) {
+        case AMQP_BASIC_RETURN_METHOD: {
+            amqp_basic_return_t *m = (amqp_basic_return_t *)f.payload.method.decoded;
+            amqp_message_t msg;
+            returned = 1; rcode = m->reply_code;
+            snprintf(rtext, sizeof(rtext), "%.*s", (int)m->reply_text.len, (char *)m->reply_text.bytes);
+            if (amqp_read_message(h->conn, f.channel, &msg, 0).reply_type == AMQP_RESPONSE_NORMAL)
+                amqp_destroy_message(&msg);
+            break;
+        }
+        case AMQP_BASIC_ACK_METHOD: {
+            amqp_basic_ack_t *m = (amqp_basic_ack_t *)f.payload.method.decoded;
+            if (m->delivery_tag == want || (m->multiple && m->delivery_tag >= want)) {
+                if (returned) {
+                    set_err(h, "publish: not delivered to any queue (%d %s) - exchange '%s', routing key '%s'",
+                            rcode, rtext, exch, key);
+                    return MQE_UNROUTABLE;
+                }
+                return 0;
+            }
+            break;
+        }
+        case AMQP_BASIC_NACK_METHOD: {
+            amqp_basic_nack_t *m = (amqp_basic_nack_t *)f.payload.method.decoded;
+            if (m->delivery_tag == want || (m->multiple && m->delivery_tag >= want)) {
+                set_err(h, "publish: the broker refused the message (basic.nack)");
+                return MQE_BROKER;
+            }
+            break;
+        }
+        case AMQP_BASIC_DELIVER_METHOD: {
+            amqp_basic_deliver_t *m = (amqp_basic_deliver_t *)f.payload.method.decoded;
+            amqp_message_t msg;
+            if (amqp_read_message(h->conn, f.channel, &msg, 0).reply_type == AMQP_RESPONSE_NORMAL) {
+                queue_pending(h, m->delivery_tag, m->redelivered, m->exchange, m->routing_key,
+                              &msg.properties, msg.body);
+                amqp_destroy_message(&msg);
+            }
+            break;
+        }
+        case AMQP_CHANNEL_CLOSE_METHOD: {
+            amqp_channel_close_t *m = (amqp_channel_close_t *)f.payload.method.decoded;
+            set_err(h, "publish: broker closed channel: %d %.*s (the message was not delivered)", m->reply_code,
+                    (int)m->reply_text.len, (char *)m->reply_text.bytes);
+            note_channel_closed(h);
+            reopen_channel_if_needed(h, MQE_BROKER);
+            return MQE_BROKER;
+        }
+        case AMQP_CONNECTION_CLOSE_METHOD: {
+            amqp_connection_close_t *m = (amqp_connection_close_t *)f.payload.method.decoded;
+            set_err(h, "publish: broker closed connection: %d %.*s", m->reply_code,
+                    (int)m->reply_text.len, (char *)m->reply_text.bytes);
+            return MQE_BROKER;
+        }
+        default:
+            break;
+        }
+    }
+}
+
+/* mqconfirm(handle) -> 0 | <0
+ * Switch the connection to publisher confirms: from now on mqpublish waits until the broker has
+ * accepted the message, and fails with -11 when no queue could take it.  Cannot be switched off. */
+PROCEDURE(mqconfirm) {
+    mq_handle *h = get_handle(GETINT(ARG0));
+    int rc = 0;
+    if (!h) RETURNINTX(MQE_BADHANDLE);
+    clear_err(h);
+    if (!h->confirm) {
+        if (h->chan_dead) reopen_channel_if_needed(h, 0);
+        amqp_confirm_select(h->conn, MQ_CHANNEL);
+        rc = check_reply(h, amqp_get_rpc_reply(h->conn), "confirm.select");
+        reopen_channel_if_needed(h, rc);
+        if (rc == 0) { h->confirm = 1; h->pub_seq = 0; }
+    }
+    RETURNINTX(rc);
+    ENDPROC
+}
+
+/*
  * mqpublish(handle, exchange, routingkey, body, props) -> 0 | <0
  *
  * exchange "" publishes through the default exchange, i.e. routingkey is a
@@ -429,13 +595,15 @@ PROCEDURE(mqpublish) {
         }
     }
 
+    if (h->chan_dead) reopen_channel_if_needed(h, 0);
     rc = amqp_basic_publish(h->conn, MQ_CHANNEL, amqp_cstring_bytes(exch), amqp_cstring_bytes(key),
-                            0, 0, &bp, amqp_cstring_bytes(body));
+                            h->confirm ? 1 : 0, 0, &bp, amqp_cstring_bytes(body));
     free(pcopy);
     if (rc != AMQP_STATUS_OK) {
         set_err(h, "basic.publish: %s", amqp_error_string2(rc));
         RETURNINTX(MQE_LIBRARY);
     }
+    if (h->confirm) RETURNINTX(wait_confirm(h, exch, key));
     RETURNINTX(0);
     ENDPROC
 }
@@ -480,82 +648,65 @@ PROCEDURE(mqreceive) {
     amqp_rpc_reply_t r;
     amqp_envelope_t env;
     struct timeval tv, *ptv = NULL;
-    char tag[32], redel[2];
-    char *body;
-    amqp_basic_properties_t *p;
+    pending *n;
 
     if (!h) RETURNINTX(MQE_BADHANDLE);
     clear_err(h);
-    if (timeout_ms >= 0) {
-        tv.tv_sec = (time_t)(timeout_ms / 1000);
-        tv.tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000);
-        ptv = &tv;
-    }
-    amqp_maybe_release_buffers(h->conn);
-    r = amqp_consume_message(h->conn, &env, ptv, 0);
-    if (r.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION && r.library_error == AMQP_STATUS_TIMEOUT)
-        RETURNINTX(1);
-    if (r.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION && r.library_error == AMQP_STATUS_UNEXPECTED_STATE) {
-        /* a non-delivery frame arrived: most likely the broker closing the channel */
-        amqp_frame_t frame;
-        struct timeval none = { 0, 0 };
-        if (amqp_simple_wait_frame_noblock(h->conn, &frame, &none) == AMQP_STATUS_OK &&
-            frame.frame_type == AMQP_FRAME_METHOD &&
-            frame.payload.method.id == AMQP_CHANNEL_CLOSE_METHOD) {
-            amqp_channel_close_t *m = (amqp_channel_close_t *)frame.payload.method.decoded;
-            set_err(h, "consume: broker closed channel: %d %.*s (subscriptions are lost)", m->reply_code,
-                    (int)m->reply_text.len, (char *)m->reply_text.bytes);
-            note_channel_closed(h);
-            reopen_channel_if_needed(h, MQE_BROKER);
-            RETURNINTX(MQE_BROKER);
+    if (!h->phead) {            /* nothing set aside by a publisher confirm wait: ask the wire */
+        if (timeout_ms >= 0) {
+            tv.tv_sec = (time_t)(timeout_ms / 1000);
+            tv.tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000);
+            ptv = &tv;
         }
-        set_err(h, "consume: unexpected protocol state");
-        RETURNINTX(MQE_STATE);
-    }
-    if (r.reply_type != AMQP_RESPONSE_NORMAL) {
-        RETURNINTX(check_reply(h, r, "consume"));
-    }
-
-    p = &env.message.properties;
-    body = (char *)malloc(env.message.body.len + 1);
-    if (!body) {
-        set_err(h, "out of memory");
+        amqp_maybe_release_buffers(h->conn);
+        r = amqp_consume_message(h->conn, &env, ptv, 0);
+        if (r.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION && r.library_error == AMQP_STATUS_TIMEOUT)
+            RETURNINTX(1);
+        if (r.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION && r.library_error == AMQP_STATUS_UNEXPECTED_STATE) {
+            /* a non-delivery frame arrived: most likely the broker closing the channel */
+            amqp_frame_t frame;
+            struct timeval none = { 0, 0 };
+            if (amqp_simple_wait_frame_noblock(h->conn, &frame, &none) == AMQP_STATUS_OK &&
+                frame.frame_type == AMQP_FRAME_METHOD &&
+                frame.payload.method.id == AMQP_CHANNEL_CLOSE_METHOD) {
+                amqp_channel_close_t *m = (amqp_channel_close_t *)frame.payload.method.decoded;
+                set_err(h, "consume: broker closed channel: %d %.*s (subscriptions are lost)", m->reply_code,
+                        (int)m->reply_text.len, (char *)m->reply_text.bytes);
+                note_channel_closed(h);
+                reopen_channel_if_needed(h, MQE_BROKER);
+                RETURNINTX(MQE_BROKER);
+            }
+            set_err(h, "consume: unexpected protocol state");
+            RETURNINTX(MQE_STATE);
+        }
+        if (r.reply_type != AMQP_RESPONSE_NORMAL) {
+            RETURNINTX(check_reply(h, r, "consume"));
+        }
+        if (queue_pending(h, env.delivery_tag, env.redelivered, env.exchange, env.routing_key,
+                          &env.message.properties, env.message.body) != 0) {
+            set_err(h, "out of memory");
+            amqp_destroy_envelope(&env);
+            RETURNINTX(MQE_LIBRARY);
+        }
         amqp_destroy_envelope(&env);
-        RETURNINTX(MQE_LIBRARY);
     }
-    if (env.message.body.len) memcpy(body, env.message.body.bytes, env.message.body.len);
-    body[env.message.body.len] = '\0';
 
-    snprintf(tag, sizeof(tag), "%llu", (unsigned long long)env.delivery_tag);
-    redel[0] = env.redelivered ? '1' : '0';
-    redel[1] = '\0';
-
-    SETARRAYHI(ARG2, 7);
-    SETSARRAY(ARG2, 0, body);
-    SETSARRAY(ARG2, 1, tag);
-
-#define BYTES_TO_ARRAY(idx, flag, field) do {                                          \
-        if ((p->_flags & (flag)) && p->field.len) {                                     \
-            char *s = (char *)malloc(p->field.len + 1);                                 \
-            if (s) { memcpy(s, p->field.bytes, p->field.len); s[p->field.len] = '\0';   \
-                     SETSARRAY(ARG2, (idx), s); free(s); }                              \
-        } else SETSARRAY(ARG2, (idx), "");                                              \
-    } while (0)
-    BYTES_TO_ARRAY(2, AMQP_BASIC_REPLY_TO_FLAG, reply_to);
-    BYTES_TO_ARRAY(3, AMQP_BASIC_CORRELATION_ID_FLAG, correlation_id);
-#undef BYTES_TO_ARRAY
+    n = h->phead;
+    h->phead = n->next;
+    if (!h->phead) h->ptail = NULL;
     {
-        char *s = (char *)malloc(env.exchange.len + 1);
-        if (s) { memcpy(s, env.exchange.bytes, env.exchange.len); s[env.exchange.len] = '\0';
-                 SETSARRAY(ARG2, 4, s); free(s); }
-        s = (char *)malloc(env.routing_key.len + 1);
-        if (s) { memcpy(s, env.routing_key.bytes, env.routing_key.len); s[env.routing_key.len] = '\0';
-                 SETSARRAY(ARG2, 5, s); free(s); }
+        char redel[2];
+        redel[0] = n->redelivered; redel[1] = '\0';
+        SETARRAYHI(ARG2, 7);
+        SETSARRAY(ARG2, 0, n->body);
+        SETSARRAY(ARG2, 1, n->tag);
+        SETSARRAY(ARG2, 2, n->reply_to);
+        SETSARRAY(ARG2, 3, n->corr);
+        SETSARRAY(ARG2, 4, n->exchange);
+        SETSARRAY(ARG2, 5, n->key);
+        SETSARRAY(ARG2, 6, redel);
     }
-    SETSARRAY(ARG2, 6, redel);
-
-    free(body);
-    amqp_destroy_envelope(&env);
+    free_pending(n);
     RETURNINTX(0);
     ENDPROC
 }
@@ -614,6 +765,7 @@ LOADFUNCS
     ADDPROC(mqpurge,      "rxmq.mqpurge",      "b", ".int",    "handle=.int,queue=.string");
     ADDPROC(mqdelete,     "rxmq.mqdelete",     "b", ".int",    "handle=.int,queue=.string");
     ADDPROC(mqbind,       "rxmq.mqbind",       "b", ".int",    "handle=.int,queue=.string,exchange=.string,routingkey=.string");
+    ADDPROC(mqconfirm,    "rxmq.mqconfirm",    "b", ".int",    "handle=.int");
     ADDPROC(mqpublish,    "rxmq.mqpublish",    "b", ".int",    "handle=.int,exchange=.string,routingkey=.string,body=.string,props=.string");
     ADDPROC(mqsubscribe,  "rxmq.mqsubscribe",  "b", ".int",    "handle=.int,queue=.string,prefetch=.int");
     ADDPROC(mqreceive,    "rxmq.mqreceive",    "b", ".int",    "handle=.int,timeout=.int,expose msg=.string[]");

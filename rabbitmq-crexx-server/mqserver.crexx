@@ -79,6 +79,12 @@ if h < 1 then do
   exit 1
 end
 
+/* publisher confirms: a reply nobody can receive (the requester has gone) is reported, not dropped silently */
+if mqconfirm(h) <> 0 then do
+  say "mqserver: cannot enable publisher confirms -" mqerror(h)
+  exit 1
+end
+
 if mqqueue(h, reqqueue, "DURABLE") <> 0 then do
   say "mqserver: cannot declare queue" reqqueue "-" mqerror(h)
   exit 1

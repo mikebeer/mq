@@ -152,6 +152,13 @@ kill $W3 2>/dev/null; wait $W3 2>/dev/null
 check "example worker" "1" "$(grep -c 'working on: first job' worker.log)"
 $C purge $J >/dev/null 2>&1
 
+# with publisher confirms a request to a queue that does not exist fails at once instead of timing out
+rabbitmqctl delete_queue rxmq.test.nobody >/dev/null 2>&1
+start=$SECONDS
+out=$($C rpc rxmq.test.nobody PING 2>&1)
+check "rpc to a missing queue fails fast" "1" "$([ $((SECONDS - start)) -lt 4 ] && echo 1 || echo 0)"
+check "rpc to a missing queue says why" "1" "$(echo "$out" | grep -c 'not delivered to any queue')"
+
 # bad broker address must fail cleanly
 $C -b 127.0.0.1 -P 1 get $G >/dev/null 2>&1
 check "unreachable broker exit code" "1" "$?"
