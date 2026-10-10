@@ -1,0 +1,80 @@
+/* rxmq smoke test: publish one message to a queue and read it back */
+options levelb
+import rxfnsb
+import rxmq
+
+qname = "rxmq.smoke"
+
+h = mqconnect("localhost", 5672, "guest", "guest", "/")
+if h < 1 then do
+  say "FAIL: connect:" mqerror(0)
+  exit 1
+end
+
+if mqqueue(h, qname, "") <> 0 then do
+  say "FAIL: declare:" mqerror(h)
+  exit 1
+end
+call mqpurge h, qname
+
+if mqpublish(h, "", qname, "hello rabbit", "correlation_id=abc reply_to=nowhere") <> 0 then do
+  say "FAIL: publish:" mqerror(h)
+  exit 1
+end
+
+if mqsubscribe(h, qname, 1) <> 0 then do
+  say "FAIL: subscribe:" mqerror(h)
+  exit 1
+end
+
+msg = .string[]
+rc = mqreceive(h, 3000, msg)
+if rc <> 0 then do
+  say "FAIL: receive rc="rc mqerror(h)
+  exit 1
+end
+
+if msg[1] <> "hello rabbit" then do
+  say "FAIL: body [" || msg[1] || "]"
+  exit 1
+end
+if msg[3] <> "nowhere" then do
+  say "FAIL: reply_to [" || msg[3] || "]"
+  exit 1
+end
+if msg[4] <> "abc" then do
+  say "FAIL: correlation_id [" || msg[4] || "]"
+  exit 1
+end
+if msg[6] <> qname then do
+  say "FAIL: routing key [" || msg[6] || "]"
+  exit 1
+end
+
+call mqack h, msg[2]
+
+/* the queue is now empty: a short receive must time out with rc 1 */
+rc = mqreceive(h, 300, msg)
+if rc <> 1 then do
+  say "FAIL: expected timeout, rc="rc
+  exit 1
+end
+
+/* a broker side error (missing queue) must fail cleanly and leave the handle usable */
+if mqpurge(h, "rxmq.no.such.queue") >= 0 then do
+  say "FAIL: purge of a missing queue should fail"
+  exit 1
+end
+if pos("404", mqerror(h)) = 0 then do
+  say "FAIL: expected a 404 error text, got [" || mqerror(h) || "]"
+  exit 1
+end
+if mqqueue(h, qname, "") <> 0 then do
+  say "FAIL: handle unusable after broker error:" mqerror(h)
+  exit 1
+end
+
+call mqdelete h, qname
+call mqdisconnect h
+say "PASS: rxmq smoke"
+exit 0

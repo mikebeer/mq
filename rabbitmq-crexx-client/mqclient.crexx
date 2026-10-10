@@ -1,0 +1,152 @@
+/*
+ * mqclient - RabbitMQ command line client for cREXX
+ *
+ * usage: mqclient [options] command queue [text...]
+ *   -b broker     RabbitMQ broker name or address   (default localhost)
+ *   -P port       AMQP port                         (default 5672)
+ *   -u user       user name                         (default guest)
+ *   -p password   password                          (default guest)
+ *   -v vhost      virtual host                      (default /)
+ *   -t ms         wait time for rpc/get in ms       (default 5000)
+ *
+ * Commands:
+ *   send queue text...   publish text to queue (durable queue, persistent message)
+ *   rpc  queue text...   send a request and print the reply (see mqserver)
+ *   get  queue           fetch one message from queue and print it
+ *   purge queue          remove all messages from queue
+ *
+ * Exit code: 0 ok, 1 failure or timeout, 2 usage error.
+ */
+options levelb
+import rxfnsb
+import rxmq
+
+arg argv = .string[]
+
+broker = "localhost"
+port = 5672
+user = "guest"
+pass = "guest"
+vhost = "/"
+waitms = 5000
+
+i = 1
+do while i <= argv.0
+  opt = argv[i]
+  if left(opt, 1) <> "-" then leave
+  if i = argv.0 then do
+    say "mqclient: option" opt "needs a value"
+    exit 2
+  end
+  i = i + 1
+  val = argv[i]
+  if opt = "-b" then broker = val
+  else if opt = "-P" then port = val
+  else if opt = "-u" then user = val
+  else if opt = "-p" then pass = val
+  else if opt = "-v" then vhost = val
+  else if opt = "-t" then waitms = val
+  else do
+    say "mqclient: unknown option" opt
+    exit 2
+  end
+  i = i + 1
+end
+
+if i + 1 > argv.0 then do
+  say "usage: mqclient [-b broker] [-P port] [-u user] [-p password] [-v vhost] [-t ms] send|rpc|get|purge queue [text...]"
+  exit 2
+end
+command = lower(argv[i])
+target = argv[i + 1]
+
+text = ""
+j = i + 2
+do while j <= argv.0
+  text = strip(text argv[j])
+  j = j + 1
+end
+
+if command <> "send" & command <> "rpc" & command <> "get" & command <> "purge" then do
+  say "mqclient: unknown command" command
+  exit 2
+end
+if (command = "send" | command = "rpc") & text = "" then do
+  say "mqclient:" command "needs some text to send"
+  exit 2
+end
+
+h = mqconnect(broker, port, user, pass, vhost)
+if h < 1 then do
+  say "mqclient: cannot connect to" broker || ":" || port "-" mqerror(0)
+  exit 1
+end
+
+result = 0
+
+if command = "send" then do
+  if mqqueue(h, target, "DURABLE") <> 0 then result = fail(h, "declare " || target)
+  else if mqpublish(h, "", target, text, "persistent") <> 0 then result = fail(h, "publish")
+  else say "sent to" target
+end
+
+if command = "purge" then do
+  n = mqpurge(h, target)
+  if n < 0 then result = fail(h, "purge " || target)
+  else say "purged" n "message(s) from" target
+end
+
+if command = "get" then do
+  msg = .string[]
+  if mqsubscribe(h, target, 1) <> 0 then result = fail(h, "subscribe " || target)
+  else do
+    rc = mqreceive(h, waitms, msg)
+    if rc = 1 then do
+      say "mqclient: no message on" target "within" waitms "ms"
+      result = 1
+    end
+    else if rc <> 0 then result = fail(h, "receive")
+    else do
+      say msg[1]
+      call mqack h, msg[2]
+    end
+  end
+end
+
+if command = "rpc" then do
+  replyq = mqtempqueue(h)
+  corr = "rpc-" || random(1, 99999) || "-" || random(1, 99999)
+  msg = .string[]
+  if replyq = "" then result = fail(h, "create reply queue")
+  else if mqsubscribe(h, replyq, 1) <> 0 then result = fail(h, "subscribe reply queue")
+  else if mqpublish(h, "", target, text, "reply_to=" || replyq || " correlation_id=" || corr) <> 0 then result = fail(h, "publish request")
+  else do
+    got = 0
+    do while got = 0
+      rrc = mqreceive(h, waitms, msg)
+      if rrc = 1 then do
+        say "mqclient: no reply from" target "within" waitms "ms"
+        result = 1
+        leave
+      end
+      if rrc <> 0 then do
+        result = fail(h, "receive reply")
+        leave
+      end
+      call mqack h, msg[2]
+      if msg[4] = corr then do
+        say msg[1]
+        got = 1
+      end
+    end
+  end
+end
+
+call mqdisconnect h
+exit result
+
+/* report a failed step, return the failure exit code */
+fail: procedure = .int
+  arg h = .int, what = .string
+  say "mqclient:" what "failed -" mqerror(h)
+  return 1

@@ -1,0 +1,166 @@
+/*
+ * mqserver - RabbitMQ request/reply service for cREXX
+ *
+ * Consumes request messages from a queue, runs them through handle() and,
+ * when the request carries a reply_to queue, publishes the answer there with
+ * the same correlation_id.  Every message is acknowledged after it has been
+ * handled, so a crash in the middle of a request leaves it on the queue.
+ *
+ * usage: mqserver [options] queue
+ *   -b broker     RabbitMQ broker name or address   (default localhost)
+ *   -P port       AMQP port                         (default 5672)
+ *   -u user       user name                         (default guest)
+ *   -p password   password                          (default guest)
+ *   -v vhost      virtual host                      (default /)
+ *   -n count      stop after count requests         (default: run until STOP)
+ *   -V            log every request and reply
+ *
+ * Request format: VERB [text...].  Built in verbs:
+ *   PING          -> PONG
+ *   ECHO text     -> text
+ *   UPPER text    -> text in upper case
+ *   LOWER text    -> text in lower case
+ *   REVERSE text  -> text reversed
+ *   WORDS text    -> number of words in text
+ *   STOP          -> "stopping", then the server ends
+ * To serve something else, change handle() below.
+ */
+options levelb
+import rxfnsb
+import rxmq
+
+arg argv = .string[]
+
+broker = "localhost"
+port = 5672
+user = "guest"
+pass = "guest"
+vhost = "/"
+maxreq = 0
+verbose = 0
+
+i = 1
+do while i <= argv.0
+  opt = argv[i]
+  if left(opt, 1) <> "-" then leave
+  if opt = "-V" then do
+    verbose = 1
+    i = i + 1
+    iterate
+  end
+  if i = argv.0 then do
+    say "mqserver: option" opt "needs a value"
+    exit 2
+  end
+  i = i + 1
+  val = argv[i]
+  if opt = "-b" then broker = val
+  else if opt = "-P" then port = val
+  else if opt = "-u" then user = val
+  else if opt = "-p" then pass = val
+  else if opt = "-v" then vhost = val
+  else if opt = "-n" then maxreq = val
+  else do
+    say "mqserver: unknown option" opt
+    exit 2
+  end
+  i = i + 1
+end
+
+if i > argv.0 then do
+  say "usage: mqserver [-b broker] [-P port] [-u user] [-p password] [-v vhost] [-n count] [-V] queue"
+  exit 2
+end
+reqqueue = argv[i]
+
+h = mqconnect(broker, port, user, pass, vhost)
+if h < 1 then do
+  say "mqserver: cannot connect to" broker || ":" || port "-" mqerror(0)
+  exit 1
+end
+
+if mqqueue(h, reqqueue, "DURABLE") <> 0 then do
+  say "mqserver: cannot declare queue" reqqueue "-" mqerror(h)
+  exit 1
+end
+if mqsubscribe(h, reqqueue, 1) <> 0 then do
+  say "mqserver: cannot subscribe to" reqqueue "-" mqerror(h)
+  exit 1
+end
+
+say "mqserver: serving queue" reqqueue "on" broker || ":" || port
+msg = .string[]
+served = 0
+running = 1
+idle = 0
+
+do while running = 1
+  rc = mqreceive(h, 1000, msg)
+  if rc = 1 then do
+    /* Idle.  The broker drops a consumer silently when its queue is deleted,
+       so every few idle seconds check that the queue is still there and
+       re-create and resubscribe if it is not. */
+    idle = idle + 1
+    if idle >= 5 then do
+      idle = 0
+      if mqqueue(h, reqqueue, "PASSIVE") <> 0 then do
+        say "mqserver: queue" reqqueue "is gone - re-creating it"
+        if mqqueue(h, reqqueue, "DURABLE") <> 0 then do
+          say "mqserver: cannot re-create queue -" mqerror(h)
+          leave
+        end
+        if mqsubscribe(h, reqqueue, 1) <> 0 then do
+          say "mqserver: cannot resubscribe -" mqerror(h)
+          leave
+        end
+      end
+    end
+    iterate
+  end
+  idle = 0
+  if rc <> 0 then do
+    say "mqserver: receive failed -" mqerror(h)
+    leave
+  end
+
+  request = msg[1]
+  tag = msg[2]
+  replyto = msg[3]
+  corr = msg[4]
+
+  answer = handle(request)
+  if answer = "$STOP" then do
+    answer = "stopping"
+    running = 0
+  end
+  served = served + 1
+
+  if verbose = 1 then say "request:" request "-> reply:" answer
+  if replyto <> "" then do
+    props = ""
+    if corr <> "" then props = "correlation_id=" || corr
+    if mqpublish(h, "", replyto, answer, props) <> 0 then
+      say "mqserver: reply failed -" mqerror(h)
+  end
+  call mqack h, tag
+
+  if maxreq > 0 then if served >= maxreq then running = 0
+end
+
+call mqdisconnect h
+say "mqserver: stopped after" served "request(s)"
+exit 0
+
+/* handle one request, return the reply text; "$STOP" asks the server to end */
+handle: procedure = .string
+  arg request = .string
+  verb = upper(word(request, 1))
+  rest = strip(subword(request, 2))
+  if verb = "PING" then return "PONG"
+  if verb = "ECHO" then return rest
+  if verb = "UPPER" then return upper(rest)
+  if verb = "LOWER" then return lower(rest)
+  if verb = "REVERSE" then return reverse(rest)
+  if verb = "WORDS" then return words(rest)
+  if verb = "STOP" then return "$STOP"
+  return "ERROR unknown verb" verb
