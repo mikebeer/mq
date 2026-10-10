@@ -27,6 +27,11 @@ run() {     # run <name> [args...]
     local n="$1"; shift
     rxvm "$n.rxbin" rx_rxmq "$CREXX_HOME/bin/library" -a "$@"
 }
+bg() {      # bg <name> [args...]   start in the background, pid in BGPID (the real rxvm, not a subshell)
+    local n="$1"; shift
+    rxvm "$n.rxbin" rx_rxmq "$CREXX_HOME/bin/library" -a "$@" &
+    BGPID=$!
+}
 check() {   # check <label> <expected> <actual>
     if [ "$2" = "$3" ]; then echo "[$(ts)] ok    $1"
     else echo "[$(ts)] FAIL  $1: expected [$2] got [$3]"; fails=$((fails + 1)); fi
@@ -53,8 +58,8 @@ C="run mqclient -b $MQ_BROKER -t 8000"
 $C purge $Q >/dev/null 2>&1
 
 # server handles 8 requests then stops by itself
-run mqserver -b "$MQ_BROKER" -n 8 $Q >server.log 2>&1 &
-SERVER=$!
+bg mqserver -b "$MQ_BROKER" -n 8 $Q >server.log 2>&1
+SERVER=$BGPID
 sleep 2
 
 check "rpc PING"          "PONG"                "$($C rpc $Q PING 2>&1)"
@@ -99,8 +104,8 @@ check "purge of missing queue returns in under 5s" "1" "$([ $((SECONDS - start))
 # re-create the queue, resubscribe and keep serving (idle check runs every ~5 s)
 D=rxmq.test.doomed
 $C purge $D >/dev/null 2>&1
-run mqserver -b "$MQ_BROKER" -n 1 $D >server2.log 2>&1 &
-SERVER2=$!
+bg mqserver -b "$MQ_BROKER" -n 1 $D >server2.log 2>&1
+SERVER2=$BGPID
 sleep 2
 rabbitmqctl delete_queue $D >/dev/null 2>&1
 sleep 8
@@ -113,10 +118,10 @@ $C purge $D >/dev/null 2>&1
 # two servers on one queue share the work (the broker hands out one request at a time)
 W=rxmq.test.shared
 $C purge $W >/dev/null 2>&1
-run mqserver -b "$MQ_BROKER" -V $W >w1.log 2>&1 &
-W1=$!
-run mqserver -b "$MQ_BROKER" -V $W >w2.log 2>&1 &
-W2=$!
+bg mqserver -b "$MQ_BROKER" -V $W >w1.log 2>&1
+W1=$BGPID
+bg mqserver -b "$MQ_BROKER" -V $W >w2.log 2>&1
+W2=$BGPID
 sleep 2
 for n in 1 2 3 4 5 6 7 8; do $C rpc $W echo job$n >/dev/null 2>&1; done
 sleep 1
@@ -132,14 +137,14 @@ out=$(rxvm ex_hello.rxbin rx_rxmq "$CREXX_HOME/bin/library" 2>&1)
 check "example hello" "received: Hello, broker" "$out"
 J=rxmq.test.examples
 $C purge $J >/dev/null 2>&1
-run mqserver -b "$MQ_BROKER" -n 1 $J >server3.log 2>&1 &
-S3=$!
+bg mqserver -b "$MQ_BROKER" -n 1 $J >server3.log 2>&1
+S3=$BGPID
 sleep 2
 out=$(rxvm ex_caller.rxbin rx_rxmq "$CREXX_HOME/bin/library" -a $J 2>&1)
 check "example caller" "reply: HELLO (correlation id req-1)" "$out"
 kill $S3 2>/dev/null; wait $S3 2>/dev/null
-run ex_worker $J >worker.log 2>&1 &
-W3=$!
+bg ex_worker $J >worker.log 2>&1
+W3=$BGPID
 sleep 2
 $C send $J first job >/dev/null 2>&1
 sleep 1
