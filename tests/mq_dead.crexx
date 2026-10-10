@@ -1,0 +1,22 @@
+/* mq_dead - waits on a queue; the test script then makes the broker close the connection.
+   Every later call must fail with -6 (never look like a timeout) and mqdisconnect must still work. */
+options levelb
+import rxmq
+
+h = mqconnect("localhost", 5672, "guest", "guest", "/")
+if h < 1 then do
+  say "FAIL: connect:" mqerror(0)
+  exit 1
+end
+call mqqueue h, "rxmq.test.dead", "DURABLE"
+call mqsubscribe h, "rxmq.test.dead", 1
+msg = .string[]
+rc = 1
+do i = 1 to 12 while rc = 1
+  rc = mqreceive(h, 1000, msg)
+end
+pub = mqpublish(h, "", "rxmq.test.dead", "x", "")
+que = mqqueue(h, "rxmq.test.dead", "DURABLE")
+rc2 = mqreceive(h, 300, msg)
+say "receive" rc "publish" pub "queue" que "receive again" rc2
+say "disconnect" mqdisconnect(h)

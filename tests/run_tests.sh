@@ -41,6 +41,7 @@ build mq_smoke  "$REPO/tests/mq_smoke.crexx"
 build mqserver  "$REPO/rabbitmq-crexx-server/mqserver.crexx"
 build mqclient  "$REPO/rabbitmq-crexx-client/mqclient.crexx"
 build mq_pubsub "$REPO/tests/mq_pubsub.crexx"
+build mq_dead    "$REPO/tests/mq_dead.crexx"
 build ex_hello  "$REPO/examples/hello.crexx"
 build ex_worker "$REPO/examples/worker.crexx"
 build ex_caller "$REPO/examples/caller.crexx"
@@ -151,6 +152,24 @@ sleep 1
 kill $W3 2>/dev/null; wait $W3 2>/dev/null
 check "example worker" "1" "$(grep -c 'working on: first job' worker.log)"
 $C purge $J >/dev/null 2>&1
+
+# the broker closes the connection under a waiting program: every call must say so (-6), none may look like a timeout
+bg mq_dead >dead.log 2>&1
+DEAD=$BGPID
+sleep 2.5
+rabbitmqctl close_all_connections "rxmq test: close under a waiting program" >/dev/null 2>&1
+for _ in $(seq 1 30); do kill -0 $DEAD 2>/dev/null || break; sleep 0.5; done
+kill $DEAD 2>/dev/null; wait $DEAD 2>/dev/null
+check "connection closed by the broker" "receive -6 publish -6 queue -6 receive again -6|disconnect 0" "$(paste -sd'|' dead.log)"
+
+# a server whose connection the broker closes must stop with exit code 1
+bg mqserver -b "$MQ_BROKER" rxmq.test.dead2 >server4.log 2>&1
+S4=$BGPID
+sleep 2.5
+rabbitmqctl close_all_connections "rxmq test: close under a server" >/dev/null 2>&1
+for _ in $(seq 1 20); do kill -0 $S4 2>/dev/null || break; sleep 0.5; done
+if kill -0 $S4 2>/dev/null; then kill $S4 2>/dev/null; wait $S4 2>/dev/null; echo "[$(ts)] FAIL  server did not stop after the broker closed its connection"; fails=$((fails + 1))
+else wait $S4; check "server exit code after connection loss" "1" "$?"; fi
 
 # with publisher confirms a request to a queue that does not exist fails at once instead of timing out
 rabbitmqctl delete_queue rxmq.test.nobody >/dev/null 2>&1

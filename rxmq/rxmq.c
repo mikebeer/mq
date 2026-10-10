@@ -57,6 +57,7 @@ typedef struct pending {
 typedef struct {
     int used;
     int chan_dead;          /* broker closed the channel; reopen before further use */
+    int conn_dead;          /* the connection is gone (closed by the broker or socket error): every call fails with -6 */
     int confirm;            /* publisher confirms on: mqpublish waits for the broker's answer */
     uint64_t pub_seq;       /* number of publishes since confirm.select on this channel */
     pending *phead, *ptail;
@@ -101,6 +102,25 @@ static mq_handle *get_handle(intptr_t id)
 }
 
 static void note_channel_closed(mq_handle *h);
+
+/* The broker closed the connection, or the socket failed: nothing more can be done with this handle
+   except mqdisconnect.  Answer connection.close politely if the socket still allows it. */
+static void note_connection_dead(mq_handle *h, int answer_close)
+{
+    if (answer_close && !h->conn_dead) {
+        amqp_connection_close_ok_t ok;
+        memset(&ok, 0, sizeof(ok));
+        amqp_send_method(h->conn, 0, AMQP_CONNECTION_CLOSE_OK_METHOD, &ok);
+    }
+    h->conn_dead = 1;
+}
+
+static int is_fatal_library_error(int e)
+{
+    return e == AMQP_STATUS_CONNECTION_CLOSED || e == AMQP_STATUS_SOCKET_ERROR ||
+           e == AMQP_STATUS_TCP_ERROR || e == AMQP_STATUS_SSL_ERROR || e == AMQP_STATUS_HEARTBEAT_TIMEOUT ||
+           e == AMQP_STATUS_BAD_AMQP_DATA;
+}
 static void free_pending_list(mq_handle *h);
 
 /* Turn an amqp_rpc_reply_t into 0 / negative code, recording text. */
@@ -114,6 +134,7 @@ static int check_reply(mq_handle *h, amqp_rpc_reply_t r, const char *ctx)
         return MQE_LIBRARY;
     case AMQP_RESPONSE_LIBRARY_EXCEPTION:
         set_err(h, "%s: %s", ctx, amqp_error_string2(r.library_error));
+        if (h && is_fatal_library_error(r.library_error)) { note_connection_dead(h, 0); return MQE_BROKER; }
         return MQE_LIBRARY;
     case AMQP_RESPONSE_SERVER_EXCEPTION:
         switch (r.reply.id) {
@@ -121,6 +142,7 @@ static int check_reply(mq_handle *h, amqp_rpc_reply_t r, const char *ctx)
             amqp_connection_close_t *m = (amqp_connection_close_t *)r.reply.decoded;
             set_err(h, "%s: broker closed connection: %d %.*s", ctx, m->reply_code,
                     (int)m->reply_text.len, (char *)m->reply_text.bytes);
+            if (h) note_connection_dead(h, 1);
             return MQE_BROKER;
         }
         case AMQP_CHANNEL_CLOSE_METHOD: {
@@ -250,8 +272,10 @@ static void close_handle(mq_handle *h)
 {
     if (!h->used) return;
     free_pending_list(h);
-    if (!h->chan_dead) amqp_channel_close(h->conn, MQ_CHANNEL, AMQP_REPLY_SUCCESS);
-    amqp_connection_close(h->conn, AMQP_REPLY_SUCCESS);
+    if (!h->conn_dead) {
+        if (!h->chan_dead) amqp_channel_close(h->conn, MQ_CHANNEL, AMQP_REPLY_SUCCESS);
+        amqp_connection_close(h->conn, AMQP_REPLY_SUCCESS);
+    }
     amqp_destroy_connection(h->conn);
     memset(h, 0, sizeof(*h));
 }
@@ -334,6 +358,7 @@ PROCEDURE(mqexchange) {
     const char *flags = GETSTRING(ARG3);
     int rc;
     if (!h) RETURNINTX(MQE_BADHANDLE);
+    if (h->conn_dead) { set_err(h, "connection lost: the broker closed the connection (use mqdisconnect and connect again)"); RETURNINTX(MQE_BROKER); }
     if (!name || !*name) { set_err(h, "exchange name required"); RETURNINTX(MQE_ARGUMENT); }
     if (!type || !*type) type = "direct";
     clear_err(h);
@@ -353,6 +378,7 @@ PROCEDURE(mqqueue) {
     const char *flags = GETSTRING(ARG2);
     int rc;
     if (!h) RETURNINTX(MQE_BADHANDLE);
+    if (h->conn_dead) { set_err(h, "connection lost: the broker closed the connection (use mqdisconnect and connect again)"); RETURNINTX(MQE_BROKER); }
     if (!name || !*name) { set_err(h, "queue name required (use mqtempqueue for a server-named queue)"); RETURNINTX(MQE_ARGUMENT); }
     clear_err(h);
     amqp_queue_declare(h->conn, MQ_CHANNEL, amqp_cstring_bytes(name),
@@ -371,6 +397,7 @@ PROCEDURE(mqtempqueue) {
     amqp_queue_declare_ok_t *ok;
     char *name;
     if (!h) RETURNSTRX("");
+    if (h->conn_dead) { set_err(h, "connection lost"); RETURNSTRX(""); }
     clear_err(h);
     ok = amqp_queue_declare(h->conn, MQ_CHANNEL, amqp_empty_bytes, 0, 0, 1, 1, amqp_empty_table);
     if (check_reply(h, amqp_get_rpc_reply(h->conn), "queue.declare") || !ok) {
@@ -393,6 +420,7 @@ PROCEDURE(mqpurge) {
     amqp_queue_purge_ok_t *ok;
     int rc;
     if (!h) RETURNINTX(MQE_BADHANDLE);
+    if (h->conn_dead) { set_err(h, "connection lost: the broker closed the connection (use mqdisconnect and connect again)"); RETURNINTX(MQE_BROKER); }
     clear_err(h);
     ok = amqp_queue_purge(h->conn, MQ_CHANNEL, amqp_cstring_bytes(queue));
     rc = check_reply(h, amqp_get_rpc_reply(h->conn), "queue.purge");
@@ -408,6 +436,7 @@ PROCEDURE(mqdelete) {
     const char *queue = GETSTRING(ARG1);
     int rc;
     if (!h) RETURNINTX(MQE_BADHANDLE);
+    if (h->conn_dead) { set_err(h, "connection lost: the broker closed the connection (use mqdisconnect and connect again)"); RETURNINTX(MQE_BROKER); }
     clear_err(h);
     amqp_queue_delete(h->conn, MQ_CHANNEL, amqp_cstring_bytes(queue), 0, 0);
     rc = check_reply(h, amqp_get_rpc_reply(h->conn), "queue.delete");
@@ -424,6 +453,7 @@ PROCEDURE(mqbind) {
     const char *key   = GETSTRING(ARG3);
     int rc;
     if (!h) RETURNINTX(MQE_BADHANDLE);
+    if (h->conn_dead) { set_err(h, "connection lost: the broker closed the connection (use mqdisconnect and connect again)"); RETURNINTX(MQE_BROKER); }
     if (!key) key = "";
     clear_err(h);
     amqp_queue_bind(h->conn, MQ_CHANNEL, amqp_cstring_bytes(queue), amqp_cstring_bytes(exch),
@@ -456,7 +486,11 @@ static int wait_confirm(mq_handle *h, const char *exch, const char *key)
             if (++waited >= 10) { set_err(h, "publish: the broker did not confirm within 10 seconds"); return MQE_BROKER; }
             continue;
         }
-        if (rc != AMQP_STATUS_OK) { set_err(h, "publish: %s", amqp_error_string2(rc)); return MQE_LIBRARY; }
+        if (rc != AMQP_STATUS_OK) {
+            set_err(h, "publish: %s", amqp_error_string2(rc));
+            if (is_fatal_library_error(rc)) { note_connection_dead(h, 0); return MQE_BROKER; }
+            return MQE_LIBRARY;
+        }
         if (f.frame_type != AMQP_FRAME_METHOD) continue;
         switch (f.payload.method.id) {
         case AMQP_BASIC_RETURN_METHOD: {
@@ -510,6 +544,7 @@ static int wait_confirm(mq_handle *h, const char *exch, const char *key)
             amqp_connection_close_t *m = (amqp_connection_close_t *)f.payload.method.decoded;
             set_err(h, "publish: broker closed connection: %d %.*s", m->reply_code,
                     (int)m->reply_text.len, (char *)m->reply_text.bytes);
+            note_connection_dead(h, 1);
             return MQE_BROKER;
         }
         default:
@@ -525,6 +560,7 @@ PROCEDURE(mqconfirm) {
     mq_handle *h = get_handle(GETINT(ARG0));
     int rc = 0;
     if (!h) RETURNINTX(MQE_BADHANDLE);
+    if (h->conn_dead) { set_err(h, "connection lost: the broker closed the connection (use mqdisconnect and connect again)"); RETURNINTX(MQE_BROKER); }
     clear_err(h);
     if (!h->confirm) {
         if (h->chan_dead) reopen_channel_if_needed(h, 0);
@@ -557,6 +593,7 @@ PROCEDURE(mqpublish) {
     int rc;
 
     if (!h) RETURNINTX(MQE_BADHANDLE);
+    if (h->conn_dead) { set_err(h, "connection lost: the broker closed the connection (use mqdisconnect and connect again)"); RETURNINTX(MQE_BROKER); }
     if (!exch) exch = "";
     if (!key) key = "";
     if (!body) body = "";
@@ -601,6 +638,7 @@ PROCEDURE(mqpublish) {
     free(pcopy);
     if (rc != AMQP_STATUS_OK) {
         set_err(h, "basic.publish: %s", amqp_error_string2(rc));
+        if (is_fatal_library_error(rc)) { note_connection_dead(h, 0); RETURNINTX(MQE_BROKER); }
         RETURNINTX(MQE_LIBRARY);
     }
     if (h->confirm) RETURNINTX(wait_confirm(h, exch, key));
@@ -615,6 +653,7 @@ PROCEDURE(mqsubscribe) {
     int prefetch = (int)GETINT(ARG2);
     int rc;
     if (!h) RETURNINTX(MQE_BADHANDLE);
+    if (h->conn_dead) { set_err(h, "connection lost: the broker closed the connection (use mqdisconnect and connect again)"); RETURNINTX(MQE_BROKER); }
     clear_err(h);
     if (prefetch < 0) prefetch = 0;
     amqp_basic_qos(h->conn, MQ_CHANNEL, 0, (uint16_t)prefetch, 0);
@@ -651,6 +690,7 @@ PROCEDURE(mqreceive) {
     pending *n;
 
     if (!h) RETURNINTX(MQE_BADHANDLE);
+    if (h->conn_dead) { set_err(h, "connection lost: the broker closed the connection (use mqdisconnect and connect again)"); RETURNINTX(MQE_BROKER); }
     clear_err(h);
     if (!h->phead) {            /* nothing set aside by a publisher confirm wait: ask the wire */
         if (timeout_ms >= 0) {
@@ -674,6 +714,13 @@ PROCEDURE(mqreceive) {
                         (int)m->reply_text.len, (char *)m->reply_text.bytes);
                 note_channel_closed(h);
                 reopen_channel_if_needed(h, MQE_BROKER);
+                RETURNINTX(MQE_BROKER);
+            }
+            if (frame.frame_type == AMQP_FRAME_METHOD && frame.payload.method.id == AMQP_CONNECTION_CLOSE_METHOD) {
+                amqp_connection_close_t *m = (amqp_connection_close_t *)frame.payload.method.decoded;
+                set_err(h, "consume: broker closed connection: %d %.*s", m->reply_code,
+                        (int)m->reply_text.len, (char *)m->reply_text.bytes);
+                note_connection_dead(h, 1);
                 RETURNINTX(MQE_BROKER);
             }
             set_err(h, "consume: unexpected protocol state");
@@ -717,6 +764,7 @@ PROCEDURE(mqack) {
     const char *tag = GETSTRING(ARG1);
     int rc;
     if (!h) RETURNINTX(MQE_BADHANDLE);
+    if (h->conn_dead) { set_err(h, "connection lost: the broker closed the connection (use mqdisconnect and connect again)"); RETURNINTX(MQE_BROKER); }
     clear_err(h);
     rc = amqp_basic_ack(h->conn, MQ_CHANNEL, (uint64_t)strtoull(tag ? tag : "0", NULL, 10), 0);
     if (rc != AMQP_STATUS_OK) { set_err(h, "basic.ack: %s", amqp_error_string2(rc)); RETURNINTX(MQE_LIBRARY); }
@@ -731,6 +779,7 @@ PROCEDURE(mqnack) {
     int requeue = (int)GETINT(ARG2);
     int rc;
     if (!h) RETURNINTX(MQE_BADHANDLE);
+    if (h->conn_dead) { set_err(h, "connection lost: the broker closed the connection (use mqdisconnect and connect again)"); RETURNINTX(MQE_BROKER); }
     clear_err(h);
     rc = amqp_basic_nack(h->conn, MQ_CHANNEL, (uint64_t)strtoull(tag ? tag : "0", NULL, 10), 0, requeue != 0);
     if (rc != AMQP_STATUS_OK) { set_err(h, "basic.nack: %s", amqp_error_string2(rc)); RETURNINTX(MQE_LIBRARY); }

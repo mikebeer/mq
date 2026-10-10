@@ -10,7 +10,7 @@ through RabbitMQ (AMQP 0-9-1).
 | `rabbitmq-crexx-server/` | **mqserver**, a request/reply service written in cREXX. It consumes a queue, answers each request on the request's `reply_to` queue and acknowledges it. Change `handle()` to serve your own verbs. |
 | `examples/` | `hello`, `worker` and `caller`, small programs to start from. |
 | `tests/` | `mq_smoke.crexx`, `mq_pubsub.crexx` and `run_tests.sh`, which runs the whole thing against a live broker. |
-| `docs/` | `MQ-Guide-build2.docx`, the user's guide. |
+| `docs/` | `MQ-Guide-build3.docx`, the user's guide. |
 
 ## Build
 
@@ -119,6 +119,7 @@ end
 - **A deleted queue silently ends a subscription.** The broker does not tell this client. `mqserver` therefore checks every ~5 idle seconds that its queue still exists and re-creates and resubscribes if not.
 - **Reserved word.** `queue` is a keyword in Level B; do not use it as a variable name.
 - **Handles.** At most 16 connections per process, one channel each.
+- **A closed connection stays closed.** If the broker closes the connection or the network fails, every call returns `-6` until `mqdisconnect` and a new `mqconnect`. Nothing reconnects by itself.
 
 ## Tests
 
@@ -126,4 +127,4 @@ end
 plugin round trip (publish, properties, subscribe, receive, ack, timeout), the
 server with RPC verbs and self-stop, `send`/`get`, timeouts and exit codes, an
 unreachable broker, broker-side errors, and server recovery after its queue is
-deleted. It runs 27 checks and takes about 30 seconds.
+deleted. It runs 29 checks and takes about 30 seconds.

@@ -98,6 +98,7 @@ say "mqserver: serving queue" reqqueue "on" broker || ":" || port
 msg = .string[]
 served = 0
 running = 1
+failed = 0
 idle = 0
 
 do while running = 1
@@ -126,6 +127,7 @@ do while running = 1
   idle = 0
   if rc <> 0 then do
     say "mqserver: receive failed -" mqerror(h)
+    failed = 1
     leave
   end
 
@@ -155,7 +157,7 @@ end
 
 call mqdisconnect h
 say "mqserver: stopped after" served "request(s)"
-exit 0
+exit failed
 
 /* handle one request, return the reply text; "$STOP" asks the server to end */
 handle: procedure = .string
