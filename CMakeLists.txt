@@ -24,7 +24,7 @@ set(CMAKE_C_EXTENSIONS ON)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(RABBITMQ REQUIRED IMPORTED_TARGET librabbitmq)
 
-add_library(_rxmq MODULE rxmq/rxmq.c)
+add_library(_rxmq MODULE rxmq/rxmq.c rxmq/mqcore.c)
 target_include_directories(_rxmq PRIVATE
         "${CREXX_SOURCE_DIR}/rxpa"
         "${CREXX_BUILD_DIR}/generated")
@@ -35,3 +35,11 @@ set_target_properties(_rxmq PROPERTIES
         SUFFIX ".rxplugin"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# mqcore as a plain C library, and a test that uses it without cREXX
+add_library(mqcore STATIC rxmq/mqcore.c)
+target_link_libraries(mqcore PUBLIC PkgConfig::RABBITMQ)
+target_include_directories(mqcore PUBLIC rxmq)
+add_executable(mqcore_test tests/mqcore_test.c)
+target_link_libraries(mqcore_test PRIVATE mqcore)
+set_target_properties(mqcore_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

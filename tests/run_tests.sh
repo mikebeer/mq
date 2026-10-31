@@ -37,6 +37,12 @@ check() {   # check <label> <expected> <actual>
     else echo "[$(ts)] FAIL  $1: expected [$2] got [$3]"; fails=$((fails + 1)); fi
 }
 
+# mqcore from plain C, no cREXX involved
+if [ -x "$REPO/build/bin/mqcore_test" ]; then
+    check "mqcore (plain C, binary bodies)" "PASS: mqcore" "$("$REPO/build/bin/mqcore_test" 2>&1)"
+else
+    echo "[$(ts)] skip  mqcore test (build/bin/mqcore_test not built)"
+fi
 build mq_smoke  "$REPO/tests/mq_smoke.crexx"
 build mqserver  "$REPO/rabbitmq-crexx-server/mqserver.crexx"
 build mqclient  "$REPO/rabbitmq-crexx-client/mqclient.crexx"

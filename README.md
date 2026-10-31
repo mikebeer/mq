@@ -5,7 +5,8 @@ through RabbitMQ (AMQP 0-9-1).
 
 | Part | What it is |
 |---|---|
-| `rxmq/` | **rxmq**, a native RXPA plugin that wraps `librabbitmq-c`. REXX programs `import rxmq` and call `mqconnect`, `mqpublish`, `mqreceive` and friends. |
+| `rxmq/mqcore.c`, `mqcore.h` | **mqcore**, the AMQP client logic in plain C (no cREXX): connect, channel reopen, publisher confirms, delivery queue, ack/nack, dead-connection handling. Binary-safe bodies (pointer plus length). Usable from any C program; `tests/mqcore_test.c` is a worked example. |
+| `rxmq/rxmq.c` | **rxmq**, a native RXPA plugin: thin glue from REXX arguments to mqcore, on top of `librabbitmq-c`. REXX programs `import rxmq` and call `mqconnect`, `mqpublish`, `mqreceive` and friends. |
 | `rabbitmq-crexx-client/` | **mqclient**, a command line client written in cREXX: `send`, `get`, `rpc`, `purge`. |
 | `rabbitmq-crexx-server/` | **mqserver**, a request/reply service written in cREXX. It consumes a queue, answers each request on the request's `reply_to` queue and acknowledges it. Change `handle()` to serve your own verbs. |
 | `examples/` | `hello`, `worker` and `caller`, small programs to start from. |
@@ -112,7 +113,7 @@ end
 
 ## Behaviour worth knowing
 
-- **Text bodies.** Bodies are REXX strings; a body containing a NUL byte is cut at the NUL.
+- **Text bodies in REXX.** Bodies are REXX strings; a body containing a NUL byte is cut at the NUL. The C library `mqcore` underneath is binary safe.
 - **No heartbeats.** The connection is opened with heartbeats off so a program may sit idle between calls. A broker or network failure shows up as an error from the next call.
 - **Broker-side channel errors are survivable.** If the broker closes the channel (for example `mqpurge` of a missing queue gives `404 NOT_FOUND`), the call returns an error, the channel is reopened and the handle stays usable. Subscriptions on that channel are lost and must be made again.
 - **Publishing is fire-and-forget until you call `mqconfirm`.** Without confirms a message for a queue that does not exist is dropped and `mqpublish` still returns 0. `mqclient` and `mqserver` switch confirms on.
